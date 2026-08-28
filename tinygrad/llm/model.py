@@ -382,7 +382,9 @@ class GatedDeltaNetBlock(FFNBlock):
   def _init_state(self, x):
     if not hasattr(self, "conv_state"):
       self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, self.conv_channels, device=x.device).clone()
-      self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_k_dim, device=x.device).clone()
+      # fp16 state: halves VRAM (30 GDN blocks × 8 MB = 240 MB vs 480 MB fp32);
+      # the scan kernel accumulates in fp32 registers and casts on store/load.
+      self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_k_dim, dtype=dtypes.half, device=x.device).clone()
 
 class Transformer:
   def __init__(self, config:TransformerConfig):
