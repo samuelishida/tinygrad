@@ -118,7 +118,7 @@ def iq4_half_lut(device:str) -> Tensor:
                 dtype=dtypes.float16, device=device).bitcast(dtypes.uint32).contiguous()
 
 @functools.cache
-def _q8_quantize_kernel(q:UOp, scale:UOp, x:UOp, tokens:int, in_features:int) -> UOp:
+def _q8_quantize_kernel(q:UOp, scale:UOp, qsum:UOp, x:UOp, tokens:int, in_features:int) -> UOp:
   groups = in_features//Q8_GROUP_SIZE
   token_group, lane = UOp.range(tokens*groups, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
   token, group = token_group//groups, token_group%groups
@@ -128,15 +128,22 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, x:UOp, tokens:int, in_features:int) ->
   xs = tuple(x[token, group, word_lane*4+i].float() for i in range(4))
   word = sum(((v/group_scale).round().clip(-127, 127).cast(dtypes.int8).cast(dtypes.uint8).cast(dtypes.uint32) << (i*8)
               for i,v in enumerate(xs)), UOp.const(0, dtypes.uint32))
-  stores = (q[token, group, lane.valid(lane < 8)].store(word), scale[token, group.valid(lane.eq(0))].store(group_scale))
+  # per-group activation byte sum (int32, exact in fp32): the decode kernel
+  # reads this instead of recomputing it with 8 dp4a per output element —
+  # bit-identical (the same stored bytes, integer addition).
+  partial = sum(((word >> (i*8)).cast(dtypes.uint8).bitcast(dtypes.int8).cast(dtypes.int32) for i in range(4)), UOp.const(0, dtypes.int32))
+  group_qsum = warp_reduce((lane < 8).where(partial, UOp.const(0, dtypes.int32)).cast(dtypes.float), full_wave=True).cast(dtypes.int32)
+  stores = (q[token, group, lane.valid(lane < 8)].store(word), scale[token, group.valid(lane.eq(0))].store(group_scale),
+            qsum[token, group.valid(lane.eq(0))].store(group_qsum))
   return UOp.group(*stores).end(token_group, lane).sink(arg=KernelInfo(name="q8_quantize", opts_to_apply=()))
 
-def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor]:
+def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, Tensor]:
   groups = in_features//Q8_GROUP_SIZE
   q = Tensor.empty(tokens, groups, 8, dtype=dtypes.uint32, device=x.device)
   scale = Tensor.empty(tokens, groups, dtype=dtypes.float32, device=x.device)
-  q, scale = Tensor.custom_kernel(q, scale, x, fxn=functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features))[:2]
-  return q, scale
+  qsum = Tensor.empty(tokens, groups, dtype=dtypes.int32, device=x.device)
+  q, scale, qsum = Tensor.custom_kernel(q, scale, qsum, x, fxn=functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features))[:3]
+  return q, scale, qsum
 
 def kv_q8_quantize(x:Tensor) -> tuple[Tensor, Tensor]:
   """Q8 the last dim in 32-wide groups: (M, D) -> (M, D//32, 8) uint32 + (M, D//32) fp32.
@@ -171,20 +178,20 @@ def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:s
     arg=KernelInfo(name=name, opts_to_apply=()))
 
 @functools.cache
-def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, out_features:int, in_features:int, ggml_type:int) -> UOp:
+def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xqsum:UOp, out_features:int, in_features:int, ggml_type:int) -> UOp:
   group_count = in_features // Q8_GROUP_SIZE
   def group_dot(token:UOp, output:UOp, group:UOp) -> UOp:
     block, subgroup = group // 8, group % 8
     xwords = _amd_load(xq[token, group, 0], 8)
     if ggml_type in (Q4_K, Q5_K):
       base = (output * in_features//GGML_BLOCK_SIZE + block) * (Q4_WORDS if ggml_type == Q4_K else Q5_WORDS)
-      qs_base, dot, qsum = base + (4 if ggml_type == Q4_K else 12) + (subgroup//2)*8, UOp.const(0, dtypes.int32), UOp.const(0, dtypes.int32)
+      qs_base, dot = base + (4 if ggml_type == Q4_K else 12) + (subgroup//2)*8, UOp.const(0, dtypes.int32)
       for word_idx in range(8):
         word = (raw[qs_base+word_idx] >> ((subgroup&1)*4).cast(dtypes.uint32)) & 0x0f0f0f0f
         if ggml_type == Q5_K: word |= ((raw[base+4+word_idx] >> subgroup.cast(dtypes.uint32)) & 0x01010101) << 4
-        dot, qsum = _amd_dp4a(word, xwords[word_idx], dot), _amd_dp4a(UOp.const(0x01010101, dtypes.uint32), xwords[word_idx], qsum)
+        dot = _amd_dp4a(word, xwords[word_idx], dot)
       d, dmin, scale, minimum = _q5_scales(raw, base, subgroup)
-      return (dot.float()*d*scale - qsum.float()*dmin*minimum) * xd[token, group]
+      return (dot.float()*d*scale - xqsum[token, group].float()*dmin*minimum) * xd[token, group]
     if ggml_type == IQ4_XS:
       base = (output * in_features//GGML_BLOCK_SIZE + block) * IQ4_WORDS
       dot = UOp.const(0, dtypes.int32)
@@ -308,10 +315,10 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
     fxn = _iq4_linear_f16_wmma_kernel if layer.ggml_type == IQ4_XS else functools.partial(_q5_linear_f16_wmma_kernel, ggml_type=layer.ggml_type)
     extra = (iq4_half_lut(str(x.device)).uop,) if layer.ggml_type == IQ4_XS else ()
     return run(fxn, out, raw, x.cast(dtypes.float16).contiguous().uop, *extra)
-  xq, xd = q8_quantize(x, tokens, in_features)
+  xq, xd, xqsum = q8_quantize(x, tokens, in_features)
   decode = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type)
   out = Tensor.empty(tokens, out_features, (in_features+1023)//1024, dtype=dtypes.float32, device=x.device).uop
-  return run(decode, out, raw, xq.uop, xd.uop)
+  return run(decode, out, raw, xq.uop, xd.uop, xqsum.uop)
 
 # ******** flash attention on the KV cache ********
 
