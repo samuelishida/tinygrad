@@ -302,6 +302,10 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   assert layer.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS)
   tokens = int(x.numel()) // layer.in_features
   raw, out_features, in_features = layer.weight.uop.buf_uop, layer.out_features, layer.in_features
+  # tokens=1 rides the WMMA path with the activation zero-padded to the 16-row
+  # tile (the 15 padded rows are sliced off): the tensor-core matmul with 16x
+  # outstanding weight loads beats the latency-bound dp4a decode path.
+  wmma = layer.ggml_type in (Q4_K, Q5_K, IQ4_XS) and out_features % 16 == 0 and (tokens % 16 == 0 or tokens == 1)
   def run(fxn:Callable[..., UOp], out:UOp, *srcs:UOp) -> Tensor:
     all_srcs = (out,)+srcs
     params = tuple(UOp.placeholder_like(src, slot=i) for i,src in enumerate(all_srcs))
@@ -310,8 +314,18 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
     if len(result.shape) == 3: result = result.sum(-1)
     result = result.reshape(*x.shape[:-1], out_features)
     return result if layer.bias is None else result + layer.bias
+  if wmma and tokens == 1:
+    fxn = _iq4_linear_f16_wmma_kernel if layer.ggml_type == IQ4_XS else functools.partial(_q5_linear_f16_wmma_kernel, ggml_type=layer.ggml_type)
+    extra = (iq4_half_lut(str(x.device)).uop,) if layer.ggml_type == IQ4_XS else ()
+    out = Tensor.empty(16, out_features, dtype=dtypes.float32, device=x.device).uop
+    xw = x.reshape(1, in_features).pad_to((16, in_features)).cast(dtypes.float16).contiguous().uop
+    all_srcs = (out, raw, xw) + extra
+    params = tuple(UOp.placeholder_like(src, slot=i) for i, src in enumerate(all_srcs))
+    kernel = fxn(*params, out_features=out_features, in_features=in_features).call(*all_srcs)
+    result = Tensor(out.after(kernel)).reshape(16, out_features)[:1]
+    return result if layer.bias is None else result + layer.bias
   out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device).uop
-  if tokens % 16 == 0 and out_features % 16 == 0 and layer.ggml_type in (Q4_K, Q5_K, IQ4_XS):
+  if wmma:
     fxn = _iq4_linear_f16_wmma_kernel if layer.ggml_type == IQ4_XS else functools.partial(_q5_linear_f16_wmma_kernel, ggml_type=layer.ggml_type)
     extra = (iq4_half_lut(str(x.device)).uop,) if layer.ggml_type == IQ4_XS else ()
     return run(fxn, out, raw, x.cast(dtypes.float16).contiguous().uop, *extra)
