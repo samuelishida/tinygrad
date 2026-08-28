@@ -334,6 +334,83 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   out = Tensor.empty(tokens, out_features, (in_features+1023)//1024, dtype=dtypes.float32, device=x.device).uop
   return run(decode, out, raw, xq.uop, xd.uop, xqsum.uop)
 
+# ******** fused MoE expert GEMM: gather on load from the packed ggml buffer ********
+
+def quant_raw_info(decoded:Tensor) -> tuple[dtypes.dtype, int, UOp]|None:
+  """Locate the packed ggml buffer inside a lazily-dequantized weight tensor.
+  Returns (packed_dtype, ggml_type, raw_packed_uop) or None if the tensor is
+  not a supported quant format. Mirrors Linear.set_quantized's search."""
+  packed_sizes = {decoded.numel() // 256 * type_size:typ for typ,type_size in QUANT_SIZES.items()}
+  raw = next((u for u in decoded.uop.toposort() if u.op is Ops.SHRINK and u.dtype == dtypes.uint8 and prod(u.shape) in packed_sizes), None)
+  if raw is None: return None
+  raw_offset = raw.contiguous_view_offset()
+  if raw_offset is None or raw_offset % 4 != 0 or raw.buf_uop.dtype != dtypes.uint8: return None
+  ggml_type = packed_sizes[prod(raw.shape)]
+  packed_dtype = dtypes.uint8 if ggml_type == Q6_K else dtypes.uint32
+  packed = UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer)
+    .view(raw.max_numel() * raw.dtype.itemsize // packed_dtype.itemsize, packed_dtype, raw_offset))
+  return packed_dtype, ggml_type, packed
+
+@functools.cache
+def _expert_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xqsum:UOp, sel:UOp, out_features:int, in_features:int, ggml_type:int) -> UOp:
+  """Decode GEMM over gathered expert rows: out[i,row] = W[sel[i], row] @ x[i].
+  Identical to _quant_decode_kernel but the weight row is addressed as
+  (sel[token]*out_features + output) — the gather happens on load, no fp16
+  materialization of the selected experts."""
+  group_count = in_features // Q8_GROUP_SIZE
+  def group_dot(token:UOp, output:UOp, group:UOp) -> UOp:
+    block, subgroup = group // 8, group % 8
+    xwords = _amd_load(xq[token, group, 0], 8)
+    row = sel[token] * out_features + output
+    if ggml_type in (Q4_K, Q5_K):
+      base = (row * in_features//GGML_BLOCK_SIZE + block) * (Q4_WORDS if ggml_type == Q4_K else Q5_WORDS)
+      qs_base = base + (4 if ggml_type == Q4_K else 12) + (subgroup//2)*8
+      dot = UOp.const(0, dtypes.int32)
+      for word_idx in range(8):
+        word = (raw[qs_base+word_idx] >> ((subgroup&1)*4).cast(dtypes.uint32)) & 0x0f0f0f0f
+        if ggml_type == Q5_K: word |= ((raw[base+4+word_idx] >> subgroup.cast(dtypes.uint32)) & 0x01010101) << 4
+        dot = _amd_dp4a(word, xwords[word_idx], dot)
+      d, dmin, scale, minimum = _q5_scales(raw, base, subgroup)
+      return (dot.float()*d*scale - xqsum[token, group].float()*dmin*minimum) * xd[token, group]
+    if ggml_type == IQ4_XS:
+      base = (row * in_features//GGML_BLOCK_SIZE + block) * IQ4_WORDS
+      dot = UOp.const(0, dtypes.int32)
+      for word_idx in range(8):
+        packed = _amd_load(raw[base + 2 + subgroup*4 + word_idx%4])
+        dot = _amd_dp4a(_iq4_bytes(packed, 4*(word_idx//4)), xwords[word_idx], dot)
+      d, scale = _iq4_scales(raw, base, subgroup)
+      return dot.float() * xd[token, group] * d * scale
+    base = (row*in_features//GGML_BLOCK_SIZE+block)*Q6_BYTES
+    dots = [UOp.const(0, dtypes.int32)] * 2
+    for word_idx in range(8):
+      pos, within = subgroup*32 + word_idx*4, (subgroup*32 + word_idx*4)%128
+      low = _amd_load(raw[base + (pos//128)*64 + within%64], 4) >> ((within//64)*4).cast(dtypes.uint8)
+      high = _amd_load(raw[base + 128 + (pos//128)*32 + within%32], 4) >> ((within//32)*2).cast(dtypes.uint8)
+      quant = ((low & 15) | ((high & 3) << 4)).bitcast(dtypes.int8) - 32
+      word = sum((quant[i].cast(dtypes.uint8).cast(dtypes.uint32) << (i*8) for i in range(4)), UOp.const(0, dtypes.uint32))
+      dots[word_idx//4] = _amd_dp4a(word, xwords[word_idx], dots[word_idx//4])
+    scales = [raw[base + 192 + subgroup*2+i].cast(dtypes.uint8).bitcast(dtypes.int8).float() for i in range(2)]
+    dbits = raw[base+208].cast(dtypes.uint16) | (raw[base+209].cast(dtypes.uint16) << 8)
+    return (dots[0].float()*scales[0] + dots[1].float()*scales[1]) * xd[token, group] * _half(dbits)
+  names = {Q4_K: "experts_q4_k", Q5_K: "experts_q5_k", IQ4_XS: "experts_iq4_xs", Q6_K: "experts_q6"}
+  return _decode_linear(out, out_features, group_count, group_dot, names[ggml_type])
+
+def expert_linear(sel:Tensor, packed:UOp, ggml_type:int, x:Tensor, out_features:int) -> Tensor:
+  """sel (k,) int32 expert ids; x (k, in_features) fp (already row-aligned with
+  sel); W packed (E, out, in) ggml. Returns (k, out_features) fp32.
+  The activation is repeated per expert row by the caller (32 KB copy — cheap)."""
+  tokens, in_features = int(x.shape[0]), int(x.shape[1])
+  xq, xd, xqsum = q8_quantize(x, tokens, in_features)
+  sel = sel.cast(dtypes.int32).reshape(tokens)
+  chunks = (in_features//Q8_GROUP_SIZE+31)//32
+  out = Tensor.empty(tokens, out_features, max(chunks, 1), dtype=dtypes.float32, device=x.device).uop
+  fxn = functools.partial(_expert_decode_kernel, ggml_type=ggml_type, out_features=out_features, in_features=in_features)
+  all_srcs = (out, packed, xq.uop, xd.uop, xqsum.uop, sel.reshape(tokens).uop)
+  params = tuple(UOp.placeholder_like(src, slot=i) for i, src in enumerate(all_srcs))
+  kernel = fxn(*params).call(*all_srcs)
+  result = Tensor(out.after(kernel)).sum(-1)
+  return result
+
 # ******** flash attention on the KV cache ********
 
 @functools.cache

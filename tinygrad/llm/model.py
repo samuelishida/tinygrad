@@ -2,7 +2,7 @@ from __future__ import annotations
 import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
-from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, kv_q8_quantize, kv_q8_dequant
+from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, kv_q8_quantize, kv_q8_dequant, quant_raw_info, expert_linear
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
@@ -24,8 +24,25 @@ class ExpertWeights:
   """Like Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
   def __init__(self, num_experts:int, in_features:int, out_features:int):
     self.weight = Tensor.zeros(num_experts, out_features, in_features)
+    self.out_features, self.in_features = out_features, in_features
+    self._packed = None  # probe once: (packed_uop, ggml_type) or False (unsupported)
   def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
+    # fused expert GEMM (AMD RDNA3): gather-on-load from the packed ggml buffer —
+    # no fp16 materialization of the selected experts (the generic path below
+    # writes+reads ~8x more DRAM per decode token).
+    if self._packed is None:
+      if amd_custom_kernels_supported(self.weight.device):
+        info = quant_raw_info(self.weight)
+        self._packed = (info[2], info[1]) if info is not None else False
+      else:
+        self._packed = False
+    if self._packed is not False and isinstance(sel.numel(), int):  # decode: static token count
+      # pair (b,t,i) with the shared activation row (gate/up) or its own row (down)
+      x2d = x.expand(*sel.shape, x.shape[-1]).reshape(-1, self.in_features)
+      packed, ggml_type = self._packed
+      out = expert_linear(sel.reshape(-1), packed, ggml_type, x2d, self.out_features)
+      return out.reshape(*sel.shape, self.out_features)
     return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
 
 def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
