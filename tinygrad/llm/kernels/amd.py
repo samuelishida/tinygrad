@@ -138,6 +138,27 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor]:
   q, scale = Tensor.custom_kernel(q, scale, x, fxn=functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features))[:2]
   return q, scale
 
+def kv_q8_quantize(x:Tensor) -> tuple[Tensor, Tensor]:
+  """Q8 the last dim in 32-wide groups: (M, D) -> (M, D//32, 8) uint32 + (M, D//32) fp32.
+  Tensor-op implementation (symbolic-shape safe): each group is int8 values + one
+  fp32 scale; 4 bytes pack into each uint32 (little-endian). The flash kernels
+  dequantize on read as int8(byte) * scale."""
+  M, D = x.shape
+  groups = D // Q8_GROUP_SIZE
+  xf = x.reshape(M, groups, Q8_GROUP_SIZE).float()
+  scale = (xf.abs().max(-1, keepdim=True) / 127).maximum(1e-8)
+  q = (xf / scale).round().clip(-127, 127).cast(dtypes.int8).cast(dtypes.uint8)
+  return q.reshape(M, groups, 8, 4).bitcast(dtypes.uint32).reshape(M, groups, 8), scale.reshape(M, groups)
+
+def kv_q8_dequant(q:Tensor, scale:Tensor) -> Tensor:
+  """Inverse of kv_q8_quantize for the non-RDNA3 fallback path: (..., G, 8) uint32 +
+  (..., G) fp32 -> (..., G*32) fp16 (element j of a group = byte j%4 of word j//4)."""
+  G = q.shape[-2]
+  flat = q.reshape(-1, G, 8)
+  bytes_ = Tensor.stack(*[(flat >> (i*8)).cast(dtypes.uint8).bitcast(dtypes.int8).float() for i in range(4)], dim=-1)
+  out = (bytes_.reshape(flat.shape[0], G, Q8_GROUP_SIZE) * scale.reshape(flat.shape[0], G, 1)).reshape(flat.shape[0], G*Q8_GROUP_SIZE)
+  return out.reshape(*q.shape[:-2], G*Q8_GROUP_SIZE).cast(dtypes.half)
+
 def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str) -> UOp:
   chunks = (group_count+31)//32
   token_output_chunk, lane = UOp.range(out.shape[0]*out_features*chunks, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
@@ -295,9 +316,10 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
 # ******** flash attention on the KV cache ********
 
 @functools.cache
-def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, max_kv_len, block_n):
+def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, cache_kv_scale, valid_kv_len, max_kv_len, block_n):
   valid_kv_len = _unbind(valid_kv_len)
-  _, B, H_KV, N, D = cast(tuple[int, int, int, int, int], cache_kv.shape)
+  _, B, H_KV, N, G8, W8 = cast(tuple[int, int, int, int, int, int], cache_kv.shape)
+  D = G8 * Q8_GROUP_SIZE  # packed: 8 groups x 8 words x 4 int8 = 256 dims
   _, H, M, _ = cast(tuple[int, int, int, int], q.shape)
   assert M == 1 and H % H_KV == 0 and D % WARP_SIZE == 0 and max_kv_len <= N and max_kv_len % block_n == 0
   G, CHUNK, DV, heads_per_wave = H // H_KV, block_n, D // WARP_SIZE, 2
@@ -317,7 +339,9 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   chunk = block_n + (offset // groups_per_chunk) * group_count
   keys = tuple(chunk*CHUNK + (offset % groups_per_chunk)*decode_group + i for i in range(decode_group))
   valid = tuple(key < valid_kv_len for key in keys)
-  kvals, vvals = (tuple(tuple(is_valid.where(cache_kv[kv, b, kv_head, key, d].float(), UOp.const(0, dtypes.float)) for d in dims)
+  kvals, vvals = (tuple(tuple(is_valid.where(
+    ((cache_kv[kv, b, kv_head, key, i, lane//4] >> ((lane%4)*8)).cast(dtypes.uint8).bitcast(dtypes.int8).float()
+       * cache_kv_scale[kv, b, kv_head, key, i]), UOp.const(0, dtypes.float)) for i in range(DV))
     for key,is_valid in zip(keys, valid)) for kv in range(2))
   q_heads = tuple(kv_head*G + head_group*head_tile + wave*heads_per_wave + head for head in range(heads_per_wave))
   updates:list[UOp] = []
@@ -336,13 +360,13 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
     [stats[b, q_head.valid(lane.eq(0)), block_n, i].store(x[head]) for head,q_head in enumerate(q_heads) for i,x in enumerate((row_max, row_sum))]
   return UOp.group(*stores).end(lane, wave, block_n, block_bhkv).sink(arg=KernelInfo(name="flash_decode_partial", opts_to_apply=()))
 
-def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, max_kv_len:int) -> Tensor:
-  B, H, D = cache_kv.shape[1], q.shape[1], cache_kv.shape[4]
+def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor, valid_kv_len:int|UOp, max_kv_len:int) -> Tensor:
+  B, H = cache_kv.shape[1], q.shape[1]
   chunks = min(64, max_kv_len // 128)
-  partial = Tensor.empty(B, H, chunks, D, dtype="float32", device=q.device)
+  partial = Tensor.empty(B, H, chunks, q.shape[-1], dtype="float32", device=q.device)
   stats = Tensor.empty(B, H, chunks, 2, dtype="float32", device=q.device)
   fxn = functools.partial(_amd_flash_attention_decode_partial, valid_kv_len=valid_kv_len, max_kv_len=max_kv_len, block_n=128)
-  partial, stats = Tensor.custom_kernel(partial, stats, q, cache_kv, fxn=fxn)[:2]
+  partial, stats = Tensor.custom_kernel(partial, stats, q, cache_kv, cache_kv_scale, fxn=fxn)[:2]
   live = (valid_kv_len+127)//128
   live = min(live, chunks) if isinstance(live, int) else live.minimum(chunks)
   partial, stats = partial[:, :, :live], stats[:, :, :live]
@@ -350,12 +374,14 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
   return ((partial*weights.unsqueeze(-1)).sum(2) / (stats[..., 1]*weights).sum(2, keepdim=True)).unsqueeze(2)
 
 @functools.cache
-def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:int|UOp|None=None) -> UOp:
+def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, cache_scale:UOp, valid_kv_len:int|UOp, q_start:int|UOp|None=None) -> UOp:
   valid_kv_len, q_start = _unbind(valid_kv_len), _unbind(q_start) if q_start is not None else None
   BH, M, D = q.shape
-  _, B, H_KV, physical_n, cache_dim = cache.shape
-  k, v = cache[0].reshape(B*H_KV, physical_n, cache_dim), cache[1].reshape(B*H_KV, physical_n, cache_dim)
-  assert k.shape == v.shape and BH % k.shape[0] == 0 and k.shape[2] == D
+  _, B, H_KV, physical_n, G8, W8 = cast(tuple[int, int, int, int, int, int], cache.shape)
+  assert G8 * Q8_GROUP_SIZE == D and W8 == 8  # packed Q8 KV: G8 groups x 8 uint32 words per row
+  k, v = cache[0].reshape(B*H_KV, physical_n*G8*W8), cache[1].reshape(B*H_KV, physical_n*G8*W8)
+  ks, vs = cache_scale[0].reshape(B*H_KV, physical_n*G8), cache_scale[1].reshape(B*H_KV, physical_n*G8)
+  assert BH % k.shape[0] == 0
   gqa_group = BH // k.shape[0]
   if isinstance(M, int) and isinstance(valid_kv_len, int): assert M % BLOCK_M == 0 and valid_kv_len % BLOCK_N == 0
   assert isinstance(D, int) and D % WMMA_K == 0 and D % LANES_PER_WAVE_N == 0
@@ -366,6 +392,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   kv_head = block_bh // gqa_group
   q, o = (x.reshape(BH, M//BLOCK_M, BLOCK_M, D)[block_bh, block_m] for x in (q, o))
   k, v = k[kv_head], v[kv_head]
+  ks, vs = ks[kv_head], vs[kv_head]
   wave_m, wave_n, lane = UOp.range(WAVES_M, 2, AxisType.LOCAL), UOp.range(WAVES_N, 3, AxisType.LOCAL), UOp.range(WARP_SIZE, -1, AxisType.WARP)
   tid, lane_m, lane_n = (wave_m * WAVES_N + wave_n) * WARP_SIZE + lane, lane // LANES_PER_WAVE_N, lane % LANES_PER_WAVE_N
   Q_ELEMS_PER_THREAD, KV_ELEMS_PER_THREAD = BLOCK_M * D // THREADS_PER_BLOCK, BLOCK_N * D // THREADS_PER_BLOCK
@@ -375,9 +402,18 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   n_tile = UOp.range((q_base + (block_m + 1) * BLOCK_M + BLOCK_N - 1) // BLOCK_N, 100, AxisType.REDUCE)
   Q_lds = QP_lds[:, :D]
   Q_store = Q_lds.after(n_tile).reshape(THREADS_PER_BLOCK, Q_ELEMS_PER_THREAD)[tid].store(q.reshape(THREADS_PER_BLOCK, Q_ELEMS_PER_THREAD)[tid])
-  load_k = UOp.range(KV_ELEMS_PER_THREAD, 90)
-  kval = k.reshape(physical_n*D)[n_tile*BLOCK_N*D + tid*KV_ELEMS_PER_THREAD + load_k].float()
-  K_store = KV_lds.reshape(THREADS_PER_BLOCK, KV_ELEMS_PER_THREAD)[tid, load_k].store(kval).end(load_k)
+  # Q8 KV load: thread tid covers row tid//4, groups (tid%4)*2+{0,1} — 16 words +
+  # 2 scales, dequantized to fp16 into the same (BLOCK_N, D) LDS tile layout.
+  # flat word idx  = (n_tile*BLOCK_N + row)*64 + gpair*16 + w = n_tile*BLOCK_N*64 + tid*16 + w
+  # flat scale idx = (n_tile*BLOCK_N + row)*8  + gpair*2  + w//8 = n_tile*BLOCK_N*8 + tid*2 + w//8
+  # element j = byte j%4 of word j//4: 4 unrolled byte stores per word.
+  load_w = UOp.range(16, 90)
+  wval = k.reshape(physical_n*G8*W8)[n_tile*BLOCK_N*G8*W8 + tid*16 + load_w]
+  sval = ks[n_tile*BLOCK_N*G8 + tid*2 + load_w//8]
+  K_store = UOp.group(*tuple(
+    KV_lds.reshape(THREADS_PER_BLOCK, KV_ELEMS_PER_THREAD)[tid, load_w*4 + i].store(
+      ((wval >> (i*8)).cast(dtypes.uint8).bitcast(dtypes.int8).float() * sval).cast(dtypes.half))
+    for i in range(4))).end(load_w)
   qk_load_barrier = UOp.barrier(UOp.group(Q_store, K_store))
   Q_lds, KV_lds_k = Q_lds.after(qk_load_barrier), KV_lds.after(qk_load_barrier)
   S_reg = _reg((TM, TN), 6, 0, n_tile)
@@ -411,9 +447,13 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
                          m_i[ri4].store(m_new), beta_i[ri4].store(beta_val)).end(ri4)
   acc, l_i, m_i, beta_i = acc.after(correction), l_i.after(correction), m_i.after(correction), beta_i.after(correction)
   V_lds = UOp.placeholder((D, BLOCK_N + LDS_PAD), dtypes.half, slot=1, addrspace=AddrSpace.LOCAL)[:, :BLOCK_N]
-  V_copy, load_v = V_lds.after(qk_done).permute(1, 0), UOp.range(KV_ELEMS_PER_THREAD, 390)
-  vval = v.reshape(physical_n*D)[n_tile*BLOCK_N*D + tid*KV_ELEMS_PER_THREAD + load_v].float()
-  V_store = V_copy.reshape(THREADS_PER_BLOCK, KV_ELEMS_PER_THREAD)[tid, load_v].store(vval).end(load_v)
+  V_copy, load_v = V_lds.after(qk_done).permute(1, 0), UOp.range(16, 390)
+  wvval = v.reshape(physical_n*G8*W8)[n_tile*BLOCK_N*G8*W8 + tid*16 + load_v]
+  vsvval = vs[n_tile*BLOCK_N*G8 + tid*2 + load_v//8]
+  V_store = UOp.group(*tuple(
+    V_copy.reshape(THREADS_PER_BLOCK, KV_ELEMS_PER_THREAD)[tid, load_v*4 + i].store(
+      ((wvval >> (i*8)).cast(dtypes.uint8).bitcast(dtypes.int8).float() * vsvval).cast(dtypes.half))
+    for i in range(4))).end(load_v)
   pv_barrier = UOp.barrier(UOp.group(P_store, V_store))
   P_lds, V_lds = P_lds.after(pv_barrier), V_lds.after(pv_barrier)
   pv_acc = _reg((TM, TD), 10, 0, n_tile).after(pv_barrier)
@@ -431,10 +471,11 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
     .permute((0, 4, 2, 6, 1, 3, 5, 7)).reshape(THREADS_PER_BLOCK, TM, TD)
   return o[tid].store(acc).end(wave_m, wave_n, lane).end(block_m, block_bh).sink(arg=KernelInfo(opts_to_apply=()))
 
-def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
-  # cached flash attention on the half KV cache (already written through assigned_kv); valid_end stays bound at the graph level
+def flash_attention(q:Tensor, assigned_kv:Tensor, kv_scale:Tensor, valid_end:int|UOp) -> Tensor:
+  # cached flash attention on the Q8 KV cache (packed words + scales, already
+  # written through assigned_kv/kv_scale); valid_end stays bound at the graph level
   T_real, q_start = q.shape[2], None
-  if resolve(T_real == 1): return amd_flash_attention_decode(q.half(), assigned_kv, valid_end, cast(int, assigned_kv.shape[3]))
+  if resolve(T_real == 1): return amd_flash_attention_decode(q.half(), assigned_kv, kv_scale, valid_end, cast(int, assigned_kv.shape[3]))
   if isinstance(T_real, UOp):
     # symbolic chunk: pad the queries to the static tile; garbage rows are sliced off
     T_pad = q.max_shape[2]
@@ -443,7 +484,7 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   B, H, T, D = q.shape
   out = Tensor.empty(B*H, T, D, dtype="float32", device=q.device)
   fxn = functools.partial(_amd_flash_attention, valid_kv_len=valid_end, q_start=q_start)
-  out = Tensor.custom_kernel(out, q.half().reshape(B*H, T, D), assigned_kv, fxn=fxn)[0].reshape(B, H, T, D)
+  out = Tensor.custom_kernel(out, q.half().reshape(B*H, T, D), assigned_kv, kv_scale, fxn=fxn)[0].reshape(B, H, T, D)
   return out if q_start is None else out[:, :, :T_real]
 
 # ******** gated delta net: fused recurrent scan ********

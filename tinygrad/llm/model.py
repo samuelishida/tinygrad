@@ -2,7 +2,7 @@ from __future__ import annotations
 import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
-from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, kv_q8_quantize, kv_q8_dequant
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
@@ -184,15 +184,23 @@ class TransformerBlock(FFNBlock):
     k = apply_rope(k[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(k[..., self.config.rope_dim:], dim=-1)
 
     # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
-    store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(dtypes.half).uop)
-    assigned_kv = Tensor(self.cache_kv.uop.after(store))
+    # Q8 KV write: quantize each 32-dim group to int8 + fp32 scale (4 bytes per
+    # uint32 word); the flash kernels dequantize on read (int8(byte) * scale).
+    flat = Tensor.stack(k, v).reshape(2*B*self.config.n_kv_heads*T, self.config.head_dim)
+    kv_q8, kv_sc = kv_q8_quantize(flat)
+    q8_store = self.cache_kv[:, :, :, start_pos:start_pos+T, :, :].uop.store(
+      kv_q8.reshape(2, B, self.config.n_kv_heads, T, self.config.head_dim//32, 8).uop)
+    sc_store = self.cache_kv_scale[:, :, :, start_pos:start_pos+T, :].uop.store(
+      kv_sc.reshape(2, B, self.config.n_kv_heads, T, self.config.head_dim//32).uop)
+    assigned_kv = Tensor(self.cache_kv.uop.after(q8_store))
+    assigned_kv_scale = Tensor(self.cache_kv_scale.uop.after(sc_store))
     # on RDNA3, hybrid models use custom flash attention kernels on the KV cache
     if amd_custom_kernels_supported(x.device) and self.config.ssm is not None and self.use_flash:
-      attn = flash_attention(q, assigned_kv, start_pos+T)
+      attn = flash_attention(q, assigned_kv, assigned_kv_scale, start_pos+T)
       attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
       return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
-    k = assigned_kv[0, :, :, 0:start_pos+T, :]
-    v = assigned_kv[1, :, :, 0:start_pos+T, :]
+    k = kv_q8_dequant(assigned_kv[0, :, :, 0:start_pos+T], assigned_kv_scale[0, :, :, 0:start_pos+T])
+    v = kv_q8_dequant(assigned_kv[1, :, :, 0:start_pos+T], assigned_kv_scale[1, :, :, 0:start_pos+T])
 
     #self.cache_kv[:, :, :, start_pos:start_pos+T, :].assign(Tensor.stack(k, v))
     #k = self.cache_kv[0, :, :, 0:start_pos+T, :]
@@ -208,9 +216,14 @@ class TransformerBlock(FFNBlock):
 
   def _init_state(self, x:Tensor):
     if not hasattr(self, "cache_kv"):
-      # zeroed so the flash kernels can safely read whole tiles past the valid region (masked lanes multiply by 0)
-      self.cache_kv = Tensor.zeros(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim,
-                                   dtype=dtypes.half, device=x.device)
+      # zeroed so the flash kernels can safely read whole tiles past the valid
+      # region (masked lanes multiply by 0). Q8 layout: packed uint32 words
+      # (2,B,KvH,N,8,8) + fp32 group scales (2,B,KvH,N,8) — the flash kernels
+      # dequantize on read as int8(byte) * scale.
+      self.cache_kv = Tensor.zeros(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim//32, 8,
+                                   dtype=dtypes.uint32, device=x.device)
+      self.cache_kv_scale = Tensor.zeros(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim//32,
+                                         dtype=dtypes.float32, device=x.device)
       self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
 
 class MLATransformerBlock(FFNBlock):
