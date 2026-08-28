@@ -6,6 +6,8 @@ from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attentio
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
+MTP_TMAX = 32  # max MTP verify batch; must be a multiple of the flash BLOCK_M
+
 class ExpertGating(enum.IntEnum):
   SOFTMAX = 1
   SIGMOID = 2
@@ -84,6 +86,7 @@ class TransformerConfig:
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
     self.config = config
+    self.use_flash = True
 
     # --- RMSNorms --------------------------------------------------------
     self.attn_norm   = nn.RMSNorm(config.dim, config.norm_eps)
@@ -184,7 +187,7 @@ class TransformerBlock(FFNBlock):
     store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(dtypes.half).uop)
     assigned_kv = Tensor(self.cache_kv.uop.after(store))
     # on RDNA3, hybrid models use custom flash attention kernels on the KV cache
-    if amd_custom_kernels_supported(x.device) and self.config.ssm is not None:
+    if amd_custom_kernels_supported(x.device) and self.config.ssm is not None and self.use_flash:
       attn = flash_attention(q, assigned_kv, start_pos+T)
       attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
       return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
@@ -256,6 +259,36 @@ class MLATransformerBlock(FFNBlock):
     if not hasattr(self, "cache_k"):
       self.cache_k = Tensor.empty(x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim, device=x.device)
       self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
+
+class MTPBlock:
+  """Multi-token-prediction (DeepSeek-V3 / Qwen3-Next) draft head.
+
+  Fuses the embedding of the current token with the previous-position hidden state
+  through `enorm`/`hnorm` + `eh_proj`, runs the result through a dedicated
+  transformer block, and produces next-token logits via `shared_head_norm` + the
+  shared `output` head. `load_from_gguf` consumes the `blk.<idx>.*` and
+  `blk.<idx>.nextn.*` GGUF weights.
+  """
+  def __init__(self, config:TransformerConfig, block_cls:type[FFNBlock]):
+    self.enorm = nn.RMSNorm(config.dim, config.norm_eps)
+    self.hnorm = nn.RMSNorm(config.dim, config.norm_eps)
+    self.eh_proj = Linear(2*config.dim, config.dim, bias=False)
+    self.shared_head_norm = nn.RMSNorm(config.dim, config.norm_eps)
+    self.block = block_cls(config)
+
+  def fuse(self, emb:Tensor, hidden:Tensor) -> Tensor:
+    return self.eh_proj(self.enorm(emb).cat(self.hnorm(hidden), dim=-1))
+
+  def forward(self, fused:Tensor, start_pos:int|UOp) -> Tensor:
+    return self.block(fused, start_pos)
+
+  def load_from_gguf(self, idx:int, state_dict:dict[str, Tensor]):
+    prefix = f"blk.{idx}."
+    mtp_dict = {}
+    for k in [k for k in state_dict if k.startswith(prefix)]:
+      rel = k[len(prefix):]
+      mtp_dict[rel[len("nextn."):] if rel.startswith("nextn.") else "block."+rel] = state_dict.pop(k)
+    nn.state.load_state_dict(self, mtp_dict, consume=True, verbose=False)
 
 class GatedDeltaNetBlock(FFNBlock):
   def __init__(self, config:TransformerConfig, ssm:SSMConfig):
@@ -364,18 +397,112 @@ class Transformer:
     self.output = Linear(config.dim, config.vocab_size, bias=False)
     self.max_context = config.max_context
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
+    self.mtp: MTPBlock|None = None
+    self.max_drafts = 8
+    self.mtp_stats = {"accepted": 0, "total": 0}
     self._cached_tokens: list[int] = []
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
+    return self._forward_hidden(tokens, start_pos, temperature)[0]
+
+  def logits(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
+    """Raw next-token logits for the last token of ``tokens`` (no sampling).
+
+    Used by external engines (e.g. FreeToken) that apply their own sampler.
+    The Gumbel sample inside ``_forward_hidden`` is discarded; temperature is
+    fixed at 1.0 so the logits are raw.
+    """
+    return self._forward_hidden(tokens, start_pos, Tensor([1.0]))[2]
+
+  def _forward_hidden(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> tuple[Tensor, Tensor, Tensor]:
     x = self.token_embd(tokens).float()                   # (B, T, D)
     for block in self.blk: x = block(x, start_pos)
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
-    # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
-    return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
+    # Gumbel-sample trick: sample to softmax(logits/temp)
+    sample = (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
+    return sample, x, logits
+
+  def _logits_at(self, hidden:Tensor, idx:int) -> Tensor:
+    return self.output(self.output_norm(hidden[:, idx:idx+1]))[:, 0, :]
+
+  def mtp_forward(self, fused:Tensor, start_pos:int) -> Tensor:
+    h_mtp = self.mtp.block(fused, start_pos)
+    return self.output(self.mtp.shared_head_norm(h_mtp))[:, -1, :]
+
+  def _set_mtp_flash(self, val: bool):
+    for b in self.blk:
+      if hasattr(b, "use_flash"): b.use_flash = val
+    if self.mtp is not None and hasattr(self.mtp.block, "use_flash"):
+      self.mtp.block.use_flash = val
+
+  def _ensure_mtp_jits(self):
+    if not hasattr(self, "mtp_draft_jit"):
+      self.mtp_draft_jit = TinyJit(self.mtp_draft)
+      self.mtp_verify_jit = TinyJit(self.mtp_verify)
+      self.mtp_rollout_jit = TinyJit(self.mtp_rollout)
+      self.mtp_verify_jits: dict[int, TinyJit] = {}  # per-T (K+1) exact-batch verify graphs
+
+  def mtp_draft(self, tok:Tensor, h_q:Tensor, start_pos:int|UOp) -> tuple[Tensor, Tensor]:
+    # draft the next token with the MTP head; also return the MTP block's hidden for chaining
+    fused = self.mtp.fuse(self.token_embd(tok).float(), h_q)
+    h_mtp = self.mtp.block(fused, start_pos)
+    draft = self.output(self.mtp.shared_head_norm(h_mtp))[:, -1, :].argmax(-1, keepdim=True)
+    return draft, h_mtp[:, -1:, :].clone()
+
+  def mtp_verify(self, toks:Tensor, start_pos:int|UOp, temperature:Tensor) -> tuple[Tensor, Tensor]:
+    # run the main model over `toks` (T>=2); return per-position sampled ids and the hidden
+    x = self.token_embd(toks).float()
+    for block in self.blk: x = block(x, start_pos)
+    logits_all = self.output(self.output_norm(x))
+    # gumbel noise at the concrete max shape, sliced to the actual (symbolic) T
+    noise = Tensor.rand(1, MTP_TMAX, logits_all.shape[-1])[:, :logits_all.shape[1]]
+    sample_ids = (logits_all / temperature.maximum(1e-12) - (noise.maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
+    return sample_ids, x.contiguous()
+
+  def mtp_verify_fixed(self, toks:Tensor, start_pos:int|UOp, temperature:Tensor) -> tuple[Tensor, Tensor]:
+    """Exact-batch verify: run the main model over a *constant* T=K+1 token batch (no
+    32-padding). Must be captured with use_flash=False so the full-attention blocks use
+    standard (exact-T) attention instead of the padded batched flash; the GatedDelta
+    recurrent scan then runs exactly T steps (T_pad == T)."""
+    x = self.token_embd(toks).float()
+    for block in self.blk: x = block(x, start_pos)
+    logits_all = self.output(self.output_norm(x))
+    noise = Tensor.rand(1, x.shape[1], logits_all.shape[-1])
+    sample_ids = (logits_all / temperature.maximum(1e-12) - (noise.maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
+    return sample_ids, x.contiguous()
+
+  def _get_mtp_verify_jit(self, T:int) -> TinyJit:
+    # one exact-batch TinyJit per T (K+1); recompiles lazily only when the draft count changes
+    if T not in self.mtp_verify_jits:
+      self.mtp_verify_jits[T] = TinyJit(self.mtp_verify_fixed)
+    return self.mtp_verify_jits[T]
+
+  def mtp_rollout(self, tok:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
+    # T=1 main forward returning the hidden of `tok` at `start_pos` (reject path / first queued)
+    _, h, _ = self._forward_hidden(tok, start_pos, temperature)
+    return h.clone()
+
+  def _mtp_warmup(self):
+    self._ensure_mtp_jits()
+    try:
+      sp = UOp.variable("start_pos", 0, self.max_context-1)
+      temp = Tensor([0.0])
+      dim = self.token_embd.weight.shape[1]
+      h0 = Tensor.zeros(1, 1, dim)
+      # draft (T=1 MTP block) + rollout with flash (T=1 decode kernels)
+      self._set_mtp_flash(True)
+      d, _ = self.mtp_draft_jit(Tensor([[0]], dtype="int32"), h0, sp.bind(0)); d.realize()
+      self.mtp_rollout_jit(Tensor([[0]], dtype="int32"), sp.bind(0), temp).realize()
+      # exact-batch verify (T=2) with standard attention
+      self._set_mtp_flash(False)
+      s, h = self._get_mtp_verify_jit(2)(Tensor([[0, 0]], dtype="int32"), sp.bind(0), temp)
+      s.realize(); h.realize()
+    finally:
+      self._set_mtp_flash(True)
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
@@ -458,6 +585,12 @@ class Transformer:
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
     model = Transformer(config)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
+    # MTP head: hold `blk.<num_blocks>` as a dedicated draft block instead of dropping it
+    if (nextn := kv.get(f'{arch}.nextn_predict_layers', 0)) > 0:
+      if nextn > config.num_blocks: raise ValueError(f"nextn_predict_layers={nextn} > block_count - nextn ({config.num_blocks})")
+      block_cls = MLATransformerBlock if kv_lora_rank > 0 else TransformerBlock
+      model.mtp = MTPBlock(config, block_cls)
+      model.mtp.load_from_gguf(config.num_blocks, state_dict)
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
@@ -466,6 +599,7 @@ class Transformer:
 
   def warmup(self):
     for _ in range(2): list(zip(range(2), self.generate([0])))
+    if self.mtp is not None: self._mtp_warmup()
 
   def get_start_pos(self, tokens:list[int]) -> int:
     # recurrent state can't be partially reused after divergence: reuse it only when tokens extend the cached prefix
@@ -475,7 +609,15 @@ class Transformer:
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
-  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
+  def get_mtp_start_pos(self, tokens:list[int]) -> int:
+    # MTP reuses both the main and MTP-block caches only when `tokens` extends the cached prefix
+    if not self._cached_tokens or len(self._cached_tokens) >= len(tokens): return 0
+    return len(self._cached_tokens) if tokens[:len(self._cached_tokens)] == self._cached_tokens else 0
+
+  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0, mtp:bool=False, num_drafts:int=1, adaptive:bool=False):
+    if mtp and self.mtp is not None and num_drafts > 0:
+      yield from self._generate_mtp(tokens, temperature, num_drafts, adaptive)
+      return
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
@@ -496,3 +638,101 @@ class Transformer:
       tokens.append(int(out.item()))
       self._cached_tokens = tokens[:-1]
       yield tokens[-1]
+
+  def _generate_mtp(self, tokens:list[int], temperature:float, num_drafts:int=1, adaptive:bool=False):
+    """JIT'd MTP speculative decoding. On AMD the batched flash kernel needs the
+    query length to be a multiple of 32, but the MTP verify/prefill use small
+    variable T, so they fall back to the standard attention path. See `_mtp_loop`
+    for the decoder body."""
+    self._ensure_mtp_jits()
+    try:
+      yield from self._mtp_loop(tokens, temperature, num_drafts, adaptive)
+    finally:
+      self._set_mtp_flash(True)
+
+  def _mtp_loop(self, tokens:list[int], temperature:float, num_drafts:int=1, adaptive:bool=False):
+    """MTP speculative decoding: drafts `num_drafts` tokens with the MTP head,
+    verifies them against the main model in one batched forward, and emits the
+    longest accepted prefix. Uses three JIT graphs: mtp_draft (T=1 MTP block),
+    mtp_verify (variable-T main, T>=2), and mtp_rollout (T=1 main, reject path).
+    Maintains a separate MTP-block KV cache over the fused prompt history.
+    Does not mutate the caller's `tokens` list; builds a fresh stream instead."""
+    num_drafts = max(1, min(num_drafts, self.max_drafts))
+    window = []
+    stream = list(tokens)
+    max_ctx, prompt_len = self.max_context, len(stream)
+    if prompt_len >= max_ctx: return
+    if prompt_len == 0: raise ValueError("MTP generate requires at least one token")
+    temp = Tensor([temperature])
+    int_dtype = "int32"
+    sp = UOp.variable("start_pos", 0, max_ctx-1)
+    # 1) prefill (1 or the re-used tail). use standard attention here so any prompt
+    #    length works (the batched flash kernel requires T to be a multiple of 32).
+    self._set_mtp_flash(False)
+    start = self.get_mtp_start_pos(stream)
+    if start == 0:
+      pt = Tensor(stream, dtype=int_dtype).reshape(1, -1)
+      first_tok, hidden_p, _ = self._forward_hidden(pt, 0, temp)
+      self.mtp.block(self.mtp.fuse(self.token_embd(pt).float(), hidden_p), 0)
+    else:
+      tail = stream[start:]
+      pt = Tensor(tail, dtype=int_dtype).reshape(1, -1)
+      first_tok, hidden_p, _ = self._forward_hidden(pt, start, temp)
+      self.mtp.block(self.mtp.fuse(self.token_embd(pt).float(), hidden_p), start)
+    first_tok = int(first_tok.item())
+    # enable flash for the hot loop draft/rollout (T=1 decode); the exact-batch verify
+    # toggles it off (standard attention) so the GatedDelta scan and attention run T=K+1.
+    self._set_mtp_flash(True)
+    # 2) queue the first generated token and compute its hidden via a T=1 rollout
+    queued, queued_pos = first_tok, prompt_len
+    yield first_tok
+    stream.append(first_tok)
+    self._cached_tokens = stream[:-1]
+    h_q = self.mtp_rollout_jit(Tensor([[queued]], dtype=int_dtype), sp.bind(queued_pos), temp).realize()
+    while queued_pos + 1 < max_ctx:
+      K = min(num_drafts, max_ctx - queued_pos - 1)
+      # draft K tokens autoregressively with the MTP head
+      drafts = []
+      h_d = h_q
+      tok = queued
+      for i in range(K):
+        b, h_mtp = self.mtp_draft_jit(Tensor([[tok]], dtype=int_dtype), h_d, sp.bind(queued_pos+i))
+        b = int(b.realize().item())
+        drafts.append(b)
+        tok = b
+        h_d = h_mtp
+      # verify [queued] + drafts in one exact-batch main forward (standard attention).
+      # the fixed T=K+1 shape makes T_pad == T, so the GatedDelta scan is exact.
+      verify_toks = [queued] + drafts
+      T = len(verify_toks)
+      self._set_mtp_flash(False)
+      sample_ids, h_all = self._get_mtp_verify_jit(T)(Tensor([verify_toks], dtype=int_dtype), sp.bind(queued_pos), temp)
+      self._set_mtp_flash(True)
+      sample_ids, h_all = sample_ids.realize(), h_all.realize()
+      # longest-prefix accept: find the first draft the main model rejects
+      a = 0
+      while a < K and drafts[a] == int(sample_ids[:, a].item()): a += 1
+      self.mtp_stats["total"] += K
+      self.mtp_stats["accepted"] += a
+      if adaptive:
+        window.append(a / K)
+        if len(window) > 64: window.pop(0)
+        acc = sum(window) / len(window)
+        if acc > 0.7 and num_drafts < self.max_drafts: num_drafts += 1
+        elif acc < 0.4 and num_drafts > 1: num_drafts -= 1
+      if a == K:
+        # full accept: emit all K drafts, continue from the last draft
+        for b in drafts:
+          stream.append(b); self._cached_tokens = stream[:-1]; yield b
+        h_q = h_all[:, K:K+1, :].clone()
+        queued = drafts[-1]
+        queued_pos += K
+      else:
+        # partial/full reject: emit the accepted prefix + the true token at position a
+        for b in drafts[:a]:
+          stream.append(b); self._cached_tokens = stream[:-1]; yield b
+        true_tok = int(sample_ids[:, a].item())
+        stream.append(true_tok); self._cached_tokens = stream[:-1]; yield true_tok
+        h_q = self.mtp_rollout_jit(Tensor([[true_tok]], dtype=int_dtype), sp.bind(queued_pos+a+1), temp).realize()
+        queued = true_tok
+        queued_pos += a + 1

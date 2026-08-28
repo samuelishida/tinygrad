@@ -67,7 +67,7 @@ class Handler(HTTPRequestHandler):
     if self.path == "/v1/models": self.send_data(json.dumps({"object":"list","data":[{"id":self.server.model_name,"object":"model"}]}).encode())
     else: self.send_data((pathlib.Path(__file__).parent / "chat.html").read_bytes(), content_type="text/html")
   def run_model(self, ids:list[int], model_name:str, include_usage=False, max_tokens:int|None=None, temperature:float=0.0,
-                reasoning:bool=False):
+                reasoning:bool=False, stop:list[str]|None=None):
     model, tok = self.server.model, self.server.tok
     prompt_tokens = len(ids)
     cache_start_pos = model.get_start_pos(ids)
@@ -85,18 +85,46 @@ class Handler(HTTPRequestHandler):
       stderr_log(f"gen:{len(out)/(et-pt) if len(out) > 1 else 0:4.0f} tok/s  {colored('--', 'BLACK')}  "
                  f"out:{len(out):5d}  {colored('--', 'BLACK')}  {colored(total, 'red') if interrupted else total}\n")
     completed = False
+    stop_acc = ""
+    def stop_match(text:str) -> int:  # index of the first stop string in text, or -1
+      best = -1
+      for s in stop or []:
+        if s and (i := text.find(s)) != -1 and (best == -1 or i < best): best = i
+      return best
+    def suffix_hold(text:str) -> int:  # longest L such that some stop string starts with text[-L:]
+      best = 0
+      for s in stop or []:
+        if not s: continue
+        for cand in range(1, min(len(text), len(s)) + 1):
+          if text.endswith(s[:cand]): best = max(best, cand)
+      return best
     try:
       yield chunk({"role":"assistant", "content":""})
-      for next_id in model.generate(ids, temperature=temperature):
+      for next_id in model.generate(ids, temperature=temperature, mtp=self.server.mtp, num_drafts=self.server.num_drafts, adaptive=self.server.adaptive):
         if len(out) == 0:
           stderr_log(f"prefill:{(prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
         if tok.is_end(next_id): break
-        out.append(next_id)
-        for field, delta in router.route(dec(next_id)): yield chunk({field:delta})
+        if stop is not None:
+          # Ollama stop strings: stream exactly up to the first stop. A trailing run that
+          # could still be a prefix of a stop string is held back and emitted on the next token.
+          stop_acc += dec(next_id)
+          out.append(next_id)
+          if (i := stop_match(stop_acc)) >= 0:
+            if stop_acc[:i]: yield chunk({"content":stop_acc[:i]})
+            stop_acc = ""
+            break
+          hold = suffix_hold(stop_acc)
+          if hold: emit, stop_acc = stop_acc[:-hold], stop_acc[-hold:]
+          else: emit, stop_acc = stop_acc, ""
+          if emit: yield chunk({"content":emit})
+        else:
+          out.append(next_id)
+          for field, delta in router.route(dec(next_id)): yield chunk({field:delta})
         if max_tokens is not None and len(out) >= max_tokens:
           finish_reason = "length"
           break
-      for field, delta in router.route(dec(), final=True): yield chunk({field:delta})
+      if stop is None:
+        for field, delta in router.route(dec(), final=True): yield chunk({field:delta})
       tool_calls: list[dict] = []
       for m in re.finditer(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", router.buf, re.DOTALL):
         if (parsed := parse_tool_call(m.group(1))) is None:
@@ -126,8 +154,10 @@ class Handler(HTTPRequestHandler):
     body: dict[str, typing.Any] = json.loads(raw_body.decode("utf-8"))
     if DEBUG >= 1: print(json.dumps(body, indent=2))
     if self.path == "/v1/chat/completions":
-      # render and tokenize
+      # render and tokenize, prepending the server's default system prompt (e.g. from an Ollama .system layer)
       normalize_messages(body["messages"])
+      if (system := self.server.default_params.get("system")) and not any(m.get("role") == "system" for m in body["messages"]):
+        body["messages"].insert(0, {"role":"system", "content":system})
       rendered = self.server.template.render(messages=body["messages"], tools=body.get("tools"), add_generation_prompt=True, preserve_thinking=True)
       ids: list[int] = self.server.tok.encode(rendered)
       stderr_log(f"prep:{(time.perf_counter()-request_st)*1e3:5.0f} ms  {colored('--', 'BLACK')}  ")
@@ -137,10 +167,12 @@ class Handler(HTTPRequestHandler):
           f"{self.server.model.max_context}", "type":"invalid_request_error", "param":"messages", "code":"context_length_exceeded"}}).encode(),
           status_code=400)
 
-      # reply
-      max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
+      # reply; request fields win over the server defaults (from the Ollama .params/.config)
+      dp = self.server.default_params
+      max_tokens = body.get("max_completion_tokens") or body.get("max_tokens") or dp.get("max_tokens")
+      temperature = float(body["temperature"]) if isinstance(body.get("temperature"), (int, float)) else float(dp.get("temperature", 0.0))
       chunks = self.run_model(ids, body["model"], not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
-                              max_tokens=max_tokens, temperature=float(body.get("temperature", 0.0)),
+                              max_tokens=max_tokens, temperature=temperature, stop=dp.get("stop"),
                               reasoning=rendered.rstrip().endswith("<think>"))
       if body.get("stream"): self.stream_json(chunks)
       else:
@@ -162,6 +194,11 @@ class Handler(HTTPRequestHandler):
       raise RuntimeError(f"unhandled path {self.path}")
 
 class LLMServer(TCPServerWithReuse):
-  def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any):
+  def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any,
+               default_params:dict|None=None, mtp:bool=False, num_drafts:int=1, adaptive:bool=False):
     self.model, self.model_name, self.tok, self.template = model, model_name, tok, template
+    self.default_params: dict[str, typing.Any] = default_params or {}
+    self.mtp = mtp
+    self.num_drafts = num_drafts
+    self.adaptive = adaptive
     super().__init__(server_address, Handler)

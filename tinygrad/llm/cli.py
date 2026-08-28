@@ -1,10 +1,11 @@
 from __future__ import annotations
-import sys, argparse, codecs, itertools, typing, re, unicodedata, json, time
+import sys, argparse, codecs, itertools, typing, re, unicodedata, json, time, os, pathlib
 from typing import TYPE_CHECKING
 from tinygrad import nn
 from tinygrad.uop.ops import UOp, Ops
 from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, Context, fetch, profile_marker, getenv
 from tinygrad.llm.model import Transformer
+from tinygrad.llm import ollama as _ollama
 if TYPE_CHECKING:
   import jinja2
 
@@ -131,17 +132,94 @@ class FallbackTemplate:
 
 from tinygrad.llm.serve import LLMServer
 
-def main():
+def _resolve_model_arg(model:str, models_dir:str|None, native:bool) -> tuple[str, dict]:
+  """Map the --model arg to a loadable GGUF blob path + Ollama sampling defaults.
+
+  Order: (1) an existing local path or URL, (2) the local Ollama store (so a model the
+  user pulled with ``ollama`` wins, matching ``--model qwen3:0.6b --serve``), (3) an exact
+  key in the tinygrad ``models`` table as a fallback URL. A leading ``ollama://`` forces
+  (2). Returns ``(fetch_target, defaults)`` where ``defaults`` carries the Ollama
+  .params/.system/.config values (empty for non-Ollama sources).
+  """
+  force = model.startswith("ollama://")
+  name = model[len("ollama://"):] if force else model
+  # (1) an existing local path or URL
+  if not force and (name.startswith(("http://", "https://")) or name.startswith(("/", ".")) or os.path.isfile(name)): return name, {}
+  # (2) the local Ollama store
+  try:
+    blob = _ollama.resolve(name, root=models_dir)
+  except _ollama.OllamaNotFound:
+    if force: raise SystemExit(f"ollama store not found at {models_dir or _ollama.models_dir()}")
+    blob = None
+  except _ollama.NoModelLayer as e:
+    if native: print(f"note: {name} is a native tensor-per-layer (format B) model; not wired into serving yet: {e}")
+    raise SystemExit(f"{name} has no single-file GGUF model layer: {e}")
+  except (_ollama.ModelNotFoundError, _ollama.AmbiguousModelError):
+    if force: raise SystemExit(f"model {name!r} not found in the Ollama store")
+    blob = None
+  if blob is not None:
+    try: defaults = _ollama.ollama_defaults(name, root=models_dir)
+    except _ollama.OllamaError: defaults = {}
+    return blob, defaults
+  # (3) tinygrad built-in model table (URL) as a fallback
+  if name in models: return models[name], {}
+  if not force:
+    raise SystemExit(f"model {model!r} is not a local file/URL, not in the Ollama store (try `ollama pull {name}`), "
+                     f"and not a known tinygrad model name")
+  raise SystemExit(f"model {name!r} not found in the Ollama store")
+
+
+def _build_parser():
   parser = argparse.ArgumentParser()
-  parser.add_argument("--model", "-m", default=list(models.keys())[0], help=f"Model choice ({', '.join(models.keys())}) or path to a local GGUF file")
+  parser.add_argument("--model", "-m", default=list(models.keys())[0], help=f"Model choice ({', '.join(models.keys())}), Ollama name:tag, or path to a local GGUF file")
+  parser.add_argument("--models-dir", default=None, help="Path to the Ollama store root (defaults to $OLLAMA_MODELS or ~/.ollama/models)")
+  parser.add_argument("--native", action="store_true", help="Allow Ollama native tensor-per-layer (format B) models (best effort)")
+  parser.add_argument("--list-ollama", action="store_true", help="List the models available in the local Ollama store and exit")
+  parser.add_argument("--status", action="store_true", help="Show the device and which Ollama models tinygrad can likely load, then exit")
   parser.add_argument("--max_context", type=int, default=4096, help="Max Context Length")
   parser.add_argument("--serve", nargs='?', type=int, const=8000, metavar="PORT", help="Run OpenAI compatible API (optional port, default 8000)")
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
+  parser.add_argument("--mtp", action="store_true", help="enable multi-token-prediction speculative decoding (needs a model with an MTP head)")
+  parser.add_argument("--mtp-drafts", default="1", help="MTP draft count (int or 'auto', default 1)")
+  return parser
+
+def main():
+  parser = _build_parser()
   args = parser.parse_args()
 
+  if args.list_ollama:
+    for m in _ollama.list_models(args.models_dir): print(m)
+    return
+  if args.status:
+    from tinygrad import Device
+    print(f"device: {Device.DEFAULT}")
+    for m in _ollama.list_models(args.models_dir):
+      try:
+        layers, _ = _ollama.manifest_layers(m, root=args.models_dir)
+      except _ollama.OllamaError as e:
+        print(f"  {m}  -> {type(e).__name__}: {e}")
+        continue
+      if not layers:
+        print(f"  {m}  -> cloud/proxied (no local model blob)")
+        continue
+      try:
+        _ollama.resolve(m, root=args.models_dir); print(f"  {m}  -> single-file GGUF")
+      except _ollama.NoModelLayer:
+        print(f"  {m}  -> native tensor layers (needs --native, best effort)")
+      except _ollama.OllamaError as e:
+        print(f"  {m}  -> {type(e).__name__}: {e}")
+    return
+
+  # resolve the model: tinygrad table > local path/URL > Ollama store
+  model_path, ollama_defaults = _resolve_model_arg(args.model, args.models_dir, args.native)
+
+  # Ollama params override: num_ctx -> max_context (clamped by from_gguf to the model's own)
+  if (ctx := ollama_defaults.get("num_ctx")) is not None:
+    args.max_context = min(args.max_context, int(ctx))
+
   # load the model
-  model, kv = Transformer.from_gguf(fetch(models.get(args.model, args.model)), args.max_context)
+  model, kv = Transformer.from_gguf(fetch(model_path), args.max_context)
   model_name = kv.get('general.name') or kv.get('general.basename') or args.model
   file_sizes = [y.nbytes() for y in UOp.sink(*[x.uop for x in nn.state.get_parameters(model)]).toposort() if y.op is Ops.BUFFER]
   print(f"using model \"{model_name}\" with {sum(file_sizes):,} bytes and {sum(x.numel() for x in nn.state.get_parameters(model)):,} params, "
@@ -168,12 +246,20 @@ def main():
   if args.warmup or args.serve:
     with Context(DEBUG=max(DEBUG.value, 1)): model.warmup()
 
+  # warn when --mtp was requested but the model has no MTP head
+  if args.mtp and model.mtp is None: print("warning: model has no MTP head; ignoring --mtp")
+
+  # parse the MTP draft count (int or 'auto')
+  mtp_drafts = args.mtp_drafts
+  if mtp_drafts == "auto": num_drafts, adaptive = 1, True
+  else: num_drafts, adaptive = int(mtp_drafts), False
+
   # start server
-  if args.serve: LLMServer(('', args.serve), model, model_name, tok, template).serve_forever()
+  if args.serve: LLMServer(('', args.serve), model, model_name, tok, template, ollama_defaults, mtp=args.mtp, num_drafts=num_drafts, adaptive=adaptive).serve_forever()
 
   # do benchmark
   if args.benchmark is not None:
-    gen = model.generate(toks:=[tok.bos_id or 0])
+    gen = model.generate(toks:=[tok.bos_id or 0], temperature=float(ollama_defaults.get("temperature", 0.0)), mtp=args.mtp, num_drafts=num_drafts, adaptive=adaptive)
     for i in range(args.benchmark):
       profile_marker(f"decode @ {i}")
       GlobalCounters.reset()
@@ -184,16 +270,21 @@ def main():
         if log:
           with WallTimeEvent(BenchEvent.STEP): next(gen)
         else: next(gen)
+    if args.mtp and model.mtp is not None:
+      s = model.mtp_stats
+      pct = 100.0 * s["accepted"] / s["total"] if s["total"] else 0.0
+      print(f"mtp accept {s['accepted']}/{s['total']} ({pct:.0f}%)")
     exit(0)
 
   # interactive chat
   messages: list[dict] = []
+  if (system := ollama_defaults.get("system")): messages.append({"role":"system", "content":system})
   while 1:
     try: messages.append({"role":"user", "content":input('>>> ')})
     except EOFError: break
     ids = tok.encode(template.render(messages=messages, add_generation_prompt=True))
     reply, dec = "", tok.stream_decoder()
-    for next_id in model.generate(ids):
+    for next_id in model.generate(ids, temperature=float(ollama_defaults.get("temperature", 0.0)), mtp=args.mtp, num_drafts=num_drafts, adaptive=adaptive):
       if tok.is_end(next_id):
         sys.stdout.write(dec() + "\n\n")
         break
