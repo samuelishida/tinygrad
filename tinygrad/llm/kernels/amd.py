@@ -157,6 +157,18 @@ def kv_q8_quantize(x:Tensor) -> tuple[Tensor, Tensor]:
   q = (xf / scale).round().clip(-127, 127).cast(dtypes.int8).cast(dtypes.uint8)
   return q.reshape(M, groups, 8, 4).bitcast(dtypes.uint32).reshape(M, groups, 8), scale.reshape(M, groups)
 
+def kv_q8_quantize_batched(x:Tensor) -> tuple[Tensor, Tensor]:
+  """Same quantization as kv_q8_quantize but shape-generic: quantizes the last
+  dim in 32-wide groups over arbitrary leading batch dims using dim-SPLITS only
+  (safe under symbolic token counts, e.g. the MTP verify drafts).
+  x (..., D) -> x (..., G, 8) uint32 + (..., G) fp32."""
+  D = int(x.shape[-1]) if isinstance(x.shape[-1], int) else x.shape[-1]
+  G = D // Q8_GROUP_SIZE
+  xf = x.reshape(tuple(x.shape[:-1]) + (G, Q8_GROUP_SIZE)).float()
+  scale = (xf.abs().max(-1, keepdim=True) / 127).maximum(1e-8)
+  q = (xf / scale).round().clip(-127, 127).cast(dtypes.int8).cast(dtypes.uint8)
+  return q.reshape(tuple(q.shape[:-1]) + (Q8_GROUP_SIZE // 4, 4)).bitcast(dtypes.uint32), scale
+
 def kv_q8_dequant(q:Tensor, scale:Tensor) -> Tensor:
   """Inverse of kv_q8_quantize for the non-RDNA3 fallback path: (..., G, 8) uint32 +
   (..., G) fp32 -> (..., G*32) fp16 (element j of a group = byte j%4 of word j//4)."""

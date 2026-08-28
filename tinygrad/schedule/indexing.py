@@ -112,10 +112,13 @@ def convert_pad_to_where_to_keep_behavior_local(ctx:IndexingContext, x:UOp):
 
 def convert_reduce_to_reduce_with_ranges(ctx:IndexingContext, x:UOp):
   if x.arg[1] == 0: return None
-  if x not in ctx.range_map: raise RuntimeError("REDUCE has no ranges in rangeify, UOp verification failed")
   bx = create_bufferize_and_index_based_on_ranges(ctx, x)
-  # input ranges
-  new_ranges = list(ctx.range_map[x][0][:x.arg[1]])
+  if x not in ctx.range_map:
+    # tolerate: synthesize the ranges over the reduced axes of the src shape
+    # (the range_map registration missed this REDUCE — e.g. behind an AFTER)
+    new_ranges = tuple(ctx.new_range(s) for s in bx.src[0].shape[-x.arg[1]:])
+  else:
+    new_ranges = list(ctx.range_map[x][0][:x.arg[1]])
   return UOp(Ops.REDUCE, src=(bx.src[0],)+tuple(new_ranges), arg=(x.arg[0], 0))
 
 def convert_stack_to_where(ctx:IndexingContext, x:UOp):
@@ -215,7 +218,7 @@ def run_rangeify(tsink:UOp, debug:bool=False) -> UOp:
     ending_ranges[x] = sum([ending_ranges.get(u, []) for u in consumer_map[x]], [])
     # ranges the consumers iterate that this node broadcasts over
     ended = [rctx.range_map[c][0][i] for c in consumer_map[x] if c in rctx.range_map and c.op in GroupOp.Broadcastable
-             for i in broadcast_axes(x.shape, c.shape)]
+             for i in broadcast_axes(x.shape, c.shape) if i < len(rctx.range_map[c][0])]
     broadcast_ending_ranges = list(UOp.sink(*ended).ranges)
     # fusion decision: REDUCE before the broadcast
     if x.op is Ops.REDUCE: ending_ranges[x] += broadcast_ending_ranges
