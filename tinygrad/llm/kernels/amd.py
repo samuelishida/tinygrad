@@ -407,6 +407,14 @@ def _expert_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xqsum:UOp, sel:UOp, 
   names = {Q4_K: "experts_q4_k", Q5_K: "experts_q5_k", IQ4_XS: "experts_iq4_xs", Q6_K: "experts_q6"}
   return _decode_linear(out, out_features, group_count, group_dot, names[ggml_type])
 
+# The fused expert-decode GEMM corrupts TinyJit-captured decode graphs at runtime
+# positions >=~16K with this model (fresh-eager is exact; .plans/decode-nan-captured-jit:
+# first anomaly = block-34 MoE FFN, absmax 3.8e8 fp16-overflow; routing the MoE through
+# the generic weight[sel] path makes the captured exec 100% finite at 16K). Shipped OFF
+# until the capture-path/kernel-graph planner bug is root-caused; re-validate with
+# scripts/probe-decode-nan.py --mode capture-diag before flipping back on.
+MOE_FUSED_DECODE = False
+
 def expert_linear(sel:Tensor, packed:UOp, ggml_type:int, x:Tensor, out_features:int) -> Tensor:
   """sel (k,) int32 expert ids; x (k, in_features) fp (already row-aligned with
   sel); W packed (E, out, in) ggml. Returns (k, out_features) fp32.

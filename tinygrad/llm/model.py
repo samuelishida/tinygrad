@@ -2,7 +2,7 @@ from __future__ import annotations
 import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
-from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, kv_q8_quantize, kv_q8_quantize_batched, kv_q8_dequant, quant_raw_info, expert_linear, Q8_GROUP_SIZE
+from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, kv_q8_quantize, kv_q8_quantize_batched, kv_q8_dequant, quant_raw_info, expert_linear, Q8_GROUP_SIZE, MOE_FUSED_DECODE
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
@@ -37,7 +37,7 @@ class ExpertWeights:
         self._packed = (info[2], info[1]) if info is not None else False
       else:
         self._packed = False
-    if self._packed is not False and isinstance(sel.numel(), int):  # decode: static token count
+    if self._packed is not False and MOE_FUSED_DECODE and isinstance(sel.numel(), int):  # decode: static token count
       # pair (b,t,i) with the shared activation row (gate/up) or its own row (down)
       x2d = x.expand(*sel.shape, x.shape[-1]).reshape(-1, self.in_features)
       packed, ggml_type = self._packed
@@ -99,6 +99,20 @@ class TransformerConfig:
   routed_scaling_factor: float = 1.0
   qkv_bias: bool = False
   expert_bias: bool = False
+
+def _sub_stat(x:Tensor) -> Tensor:
+  """Lazy (n_nan, n_inf, absmax) stat tensor — the probe realizes it with the logits
+  in one realize call so the var binding flows (never realize it inside a jit fxn)."""
+  return Tensor.stack(
+    x.isnan().cast(dtypes.int32).sum().cast(dtypes.float32),
+    x.isinf().cast(dtypes.int32).sum().cast(dtypes.float32),
+    x.float().abs().max().cast(dtypes.float32))
+
+# set to a list by Transformer._forward_hidden while _per_layer_debug is on:
+# FFNBlock.__call__ then appends sub-part stats (post-attention, post-FFN) and
+# bypasses the @function dispatch (identical math, no precompile boundary).
+dbg_stats: list[Tensor] | None = None
+dbg_sub: bool = False  # also collect post-attn/post-FFN sub stats (bigger capture graph)
 
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
@@ -163,6 +177,15 @@ class FFNBlock:
 
   def __call__(self, x: Tensor, start_pos: int|UOp):
     self._init_state(x)
+    if dbg_stats is not None and dbg_sub:
+      # debug detach of the @function dispatch: same math, plain tensor calls, with
+      # sub-part stats so the diag probe can attribute a first-NaN to the attention
+      # (flash-decode / GDN scan) or the FFN (MoE) of the block.
+      h =     x + self._attention(self.attn_norm(x), start_pos)
+      dbg_stats.append(_sub_stat(h))
+      out =   h + self._feed_forward(self.ffn_norm(h))
+      dbg_stats.append(_sub_stat(out))
+      return out.contiguous()
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
@@ -458,11 +481,22 @@ class Transformer:
     """
     return self._forward_hidden(tokens, start_pos, Tensor([1.0]))[2]
 
+  _per_layer_debug = False  # set on the instance to collect per-block stats (debug)
+
   def _forward_hidden(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> tuple[Tensor, Tensor, Tensor]:
     x = self.token_embd(tokens).float()                   # (B, T, D)
-    for block in self.blk: x = block(x, start_pos)
+    if self._per_layer_debug: self._dbg_stats: list[Tensor] = []
+    global dbg_stats, dbg_sub
+    dbg_stats = self._dbg_stats if self._per_layer_debug else None
+    dbg_sub = self._per_layer_debug and getattr(self, "_sub_stats", False)
+    for i, block in enumerate(self.blk):
+      x = block(x, start_pos)
+      if self._per_layer_debug:
+        # lazy per-layer stats (resolved in the caller's single realize): n_nan, n_inf, absmax
+        self._dbg_stats.append(_sub_stat(x))
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
+    if self._per_layer_debug: dbg_stats = None
     # Gumbel-sample trick: sample to softmax(logits/temp)
     sample = (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
     return sample, x, logits
